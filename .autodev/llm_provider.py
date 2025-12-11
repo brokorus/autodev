@@ -1,4 +1,6 @@
 
+import psutil
+import shutil
 import json
 import logging
 import os
@@ -15,25 +17,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class LLMProvider:
     def __init__(self, max_vram_gb: int = 8):
+        # Maximum VRAM in GB available for models. Used to filter suitable LM Studio models.
         self.max_vram_gb = max_vram_gb
+        # Path to the Gemini CLI executable. Discovered dynamically.
         self.gemini_path = self._find_gemini_cli()
+        # The root directory of the project, used for resolving paths to app resources.
         self.project_root = Path(__file__).resolve().parent.parent
+        # Determine if AutoDev is running in offline mode based on environment variable.
         offline_flag = os.getenv("AUTODEV_OFFLINE_MODE", "").lower()
         self.offline_mode = offline_flag in {"1", "true", "yes"}
+        # LM Studio configuration parameters, loaded from environment variables or default values.
         self.lmstudio_context_limit = int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", "4096"))
         self.lmstudio_max_tokens = max(128, int(os.getenv("LMSTUDIO_MAX_TOKENS", "1024")))
         self.lmstudio_timeout_seconds = int(os.getenv("LMSTUDIO_TIMEOUT_SECONDS", "30"))
         self.lmstudio_base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234")
         self.lmstudio_health_timeout = int(os.getenv("LMSTUDIO_HEALTH_TIMEOUT", "5"))
         self.lmstudio_retries = max(1, int(os.getenv("LMSTUDIO_RETRIES", "2")))
-        # Optional overrides (by task or general)
+        # Optional LM Studio model overrides, allowing specific models for different task types or a general override.
         self.lmstudio_model_overrides = {
             "plan": os.getenv("LMSTUDIO_MODEL_PLAN"),
             "code": os.getenv("LMSTUDIO_MODEL_CODE"),
             "troubleshoot": os.getenv("LMSTUDIO_MODEL_TROUBLESHOOT"),
             "any": os.getenv("LMSTUDIO_MODEL"),
         }
+        # Cache for LM Studio's available models to avoid frequent API calls. Stores (timestamp, list_of_models).
         self._lmstudio_model_cache: Tuple[float, List[str]] = (0.0, [])
+
+        # System hardware detection
+        self.cpu_cores: int = 1
+        self.total_ram_gb: int = max_vram_gb # Fallback for now
+        self._detect_system_hardware()
 
     def plan(self, prompt: str) -> Optional[Dict]:
         if self.offline_mode:
@@ -199,14 +212,25 @@ class LLMProvider:
         )
 
     def _find_gemini_cli(self) -> Optional[str]:
+        """
+        Locates the Gemini CLI executable on the system.
+        It searches the system's PATH environment variable for the 'gemini' executable,
+        considering '.exe' or '.cmd' extensions on Windows.
+        Returns the full path to the executable if found, otherwise None.
+        """
         if platform.system() == "Windows":
             for path in os.environ["PATH"].split(os.pathsep):
                 for exe in ["gemini.exe", "gemini.cmd"]:
                     exe_path = os.path.join(path, exe)
                     if os.path.exists(exe_path):
                         return exe_path
+        elif platform.system() == "Darwin": # macOS detection
+            for path in os.environ["PATH"].split(os.pathsep):
+                exe_path = os.path.join(path, "gemini")
+                if os.path.exists(exe_path):
+                    return exe_path
         else:
-            # For Linux and macOS
+            # For Linux and other Unix-like systems
             for path in os.environ["PATH"].split(os.pathsep):
                 exe_path = os.path.join(path, "gemini")
                 if os.path.exists(exe_path):
@@ -215,6 +239,12 @@ class LLMProvider:
 
 
     def _try_gemini(self, prompt: str) -> (bool, Optional[str]):
+        """
+        Attempts to invoke the Gemini CLI with the given prompt.
+        It executes the Gemini command, captures stdout/stderr, and returns the response if successful.
+        Handles FileNotFoundError if the Gemini CLI is not found, and CalledProcessError if the CLI
+        returns an error.
+        """
         try:
             command = [self.gemini_path, "--output-format", "json"]
             result = subprocess.run(
@@ -238,9 +268,17 @@ class LLMProvider:
             return False, None
 
     def _try_lmstudio(self, prompt: str, task_type: str) -> Optional[str]:
+        """
+        Attempts to get a response from LM Studio. This function acts as a fallback
+        if the Gemini CLI is not available or fails. It selects an appropriate model,
+        trims the prompt if necessary to fit the context window, and retries the request
+        if there are transient errors or context overflow issues.
+        """
         available_models = self._lmstudio_available_models()
         model = self._select_model_for_lmstudio(task_type, available_models)
         if not model:
+            # Log a warning if no suitable LM Studio model could be selected.
+            logging.warning("No suitable LM Studio model found or selected.")
             return None
 
         timeout = self.lmstudio_timeout_seconds
@@ -339,13 +377,16 @@ class LLMProvider:
             )
             return []
 
-    def _required_vram_for_model(self, model: str, vram_requirements: Dict[str, int]) -> int:
+    def _required_vram_for_model(self, model: str) -> Optional[int]:
         """
-        Heuristic VRAM estimator: prefer explicit mappings, otherwise derive from tokens like 7B/8B.
+        Estimates VRAM in GB for a model, prioritizing benchmark data, then heuristics.
+        Returns None if no VRAM estimate can be made.
         """
-        if model in vram_requirements:
-            return vram_requirements[model]
+        model_benchmarks = self._get_model_info_from_benchmarks()
+        if model in model_benchmarks and "vram_gb" in model_benchmarks[model]:
+            return model_benchmarks[model]["vram_gb"]
 
+        # Fallback to heuristic if no benchmark data
         tokens = re.split(r"[^\w]+", model.lower())
         for token in tokens:
             if token.endswith("b") and token[:-1].isdigit():
@@ -358,7 +399,8 @@ class LLMProvider:
                     return 6
                 if size >= 13:
                     return 10
-        return self.max_vram_gb + 1
+        logging.warning(f"No VRAM benchmark data or heuristic match for model: {model}. Cannot determine VRAM requirements.")
+        return None
 
     def _get_model_override(self, task_type: str) -> Optional[str]:
         # Re-read env on each call so runtime overrides are honored
@@ -368,48 +410,136 @@ class LLMProvider:
     def _select_model_for_lmstudio(
         self, task_type: str, available_models: Optional[List[str]] = None
     ) -> Optional[str]:
-        models = {
-            "plan": ["rnj-1", "Hermes 2 Pro 7B", "Mistral 7B", "Nous-Hermes 2 7B"],
-            "code": ["rnj-1", "Qwen2.5 Coder 7B", "StarCoder 7B", "CodeGemma 7B"],
-            "troubleshoot": ["rnj-1", "MixtralInstruct 8x7B"],
+        """
+        Selects an appropriate LM Studio model based on the task type, available models,
+        VRAM requirements, and environment variable overrides.
+        Prioritizes:
+        1. Task-specific environment variable override (e.g., LMSTUDIO_MODEL_PLAN).
+        2. General environment variable override (LMSTUDIO_MODEL).
+        3. Predefined model lists for each task type, filtered by available VRAM and presence
+           in the currently available LM Studio models.
+        4. Any available LM Studio model that fits the VRAM requirements as a last resort.
+        """
+        model_benchmarks = self._get_model_info_from_benchmarks()
+        
+        models_by_task = {
+            "plan": ["rnj-1", "Hermes 2 Pro 7B", "Mistral 7B", "Nous-Hermes 2 7B", "TinyLlama-1.1B"],
+            "code": ["rnj-1", "Qwen2.5 Coder 7B", "StarCoder 7B", "CodeGemma 7B", "TinyLlama-1.1B"],
+            "troubleshoot": ["rnj-1", "MixtralInstruct 8x7B", "TinyLlama-1.1B"],
         }
-        vram_requirements = {
-            "7B": 4,
-            "8B": 5,
-            "9B": 6,
-            "8x7B": 8,
-            "MixtralInstruct 8x7B": 8,
-            "rnj-1": 8,
-        }
+
+        available_models = available_models or []
+        model_benchmarks = self._get_model_info_from_benchmarks()
 
         # Task-specific or global override takes priority
         override = self._get_model_override(task_type)
         if override:
-            if available_models and override not in available_models:
+            if override not in available_models:
                 logging.warning(
-                    "Requested LM Studio model '%s' not found in available models %s; falling back to defaults",
-                    override,
-                    available_models,
+                    f"Requested LM Studio model override '{override}' for task '{task_type}' "
+                    f"not found in available models: {available_models}. Falling back to defaults."
                 )
             else:
+                logging.info(f"Using LM Studio model override: '{override}' for task '{task_type}'.")
                 return override
 
-        available_models = available_models or []
+        eligible_models = []
+        # First, consider models specifically suggested for the task type
+        candidate_models = models_by_task.get(task_type, [])
+        # Add models from other tasks and then filter by unique names.
+        # This ensures that if a model is good for "code" and also available, it's considered for "plan" as well
+        # if no specific "plan" model fits well.
+        for other_task, models_list in models_by_task.items():
+            if other_task != task_type:
+                candidate_models.extend(models_list)
+        
+        # Ensure unique models and retain order based on task_type preference
+        seen = set()
+        unique_candidate_models = []
+        for model_name in candidate_models:
+            if model_name not in seen:
+                unique_candidate_models.append(model_name)
+                seen.add(model_name)
+        
+        # Iterate through unique candidate models first
+        for model_name in unique_candidate_models:
+            if model_name not in available_models:
+                logging.debug(f"LM Studio model '{model_name}' not currently available in LM Studio.")
+                continue
 
-        for model in models.get(task_type, []):
-            required_vram = self._required_vram_for_model(model, vram_requirements)
-            if required_vram <= self.max_vram_gb:
-                if available_models and model not in available_models:
+            model_info = model_benchmarks.get(model_name)
+            if not model_info:
+                logging.warning(f"No benchmark info found for model '{model_name}'. Skipping for intelligent selection.")
+                continue
+
+            vram_gb = model_info.get("vram_gb")
+            ram_gb = model_info.get("ram_gb")
+            performance_score = model_info.get("performance_score")
+
+            if vram_gb is None or ram_gb is None or performance_score is None:
+                logging.warning(f"Incomplete benchmark info for model '{model_name}'. Skipping for intelligent selection.")
+                continue
+
+            if vram_gb > self.max_vram_gb:
+                logging.info(f"Model '{model_name}' (VRAM: {vram_gb} GB) exceeds system max VRAM ({self.max_vram_gb} GB).")
+                continue
+            if ram_gb > self.total_ram_gb:
+                logging.info(f"Model '{model_name}' (RAM: {ram_gb} GB) exceeds system total RAM ({self.total_ram_gb} GB).")
+                continue
+
+            eligible_models.append((model_name, performance_score))
+            logging.info(
+                f"Model '{model_name}' is eligible (VRAM: {vram_gb}GB, RAM: {ram_gb}GB, Performance: {performance_score})."
+            )
+
+        if not eligible_models:
+            logging.warning(
+                "No eligible models found from predefined task lists that fit hardware constraints. "
+                "Expanding search to all available LM Studio models."
+            )
+            # Fallback: Check all available models if none from the task-specific list fit
+            for model_name in available_models:
+                if (model_name, 0) in eligible_models: # Avoid re-adding if already processed
                     continue
-                return model
+                    
+                model_info = model_benchmarks.get(model_name)
+                if not model_info:
+                    logging.warning(f"No benchmark info found for model '{model_name}'. Skipping for intelligent selection.")
+                    continue
 
-        # As a last resort, pick any available model that fits VRAM
-        for model in available_models:
-            required_vram = self._required_vram_for_model(model, vram_requirements)
-            if required_vram <= self.max_vram_gb:
-                return model
+                vram_gb = model_info.get("vram_gb")
+                ram_gb = model_info.get("ram_gb")
+                performance_score = model_info.get("performance_score")
 
-        return None
+                if vram_gb is None or ram_gb is None or performance_score is None:
+                    logging.warning(f"Incomplete benchmark info for model '{model_name}'. Skipping for intelligent selection.")
+                    continue
+
+                if vram_gb > self.max_vram_gb:
+                    logging.info(f"Model '{model_name}' (VRAM: {vram_gb} GB) exceeds system max VRAM ({self.max_vram_gb} GB).")
+                    continue
+                if ram_gb > self.total_ram_gb:
+                    logging.info(f"Model '{model_name}' (RAM: {ram_gb} GB) exceeds system total RAM ({self.total_ram_gb} GB).")
+                    continue
+                eligible_models.append((model_name, performance_score))
+                logging.info(
+                    f"Model '{model_name}' is eligible (VRAM: {vram_gb}GB, RAM: {ram_gb}GB, Performance: {performance_score})."
+                )
+
+
+        if eligible_models:
+            # Sort by performance score (descending) and pick the best
+            eligible_models.sort(key=lambda x: x[1], reverse=True)
+            selected_model = eligible_models[0][0]
+            logging.info(f"Selected LM Studio model: '{selected_model}' (Performance: {eligible_models[0][1]}).")
+            return selected_model
+        else:
+            logging.error(
+                "No suitable LM Studio model found that fits hardware constraints after checking "
+                "predefined lists and all available models. "
+                "Please check LM Studio is running and has models loaded, or adjust hardware."
+            )
+            return None
 
     # ---- Rule-based fallbacks -------------------------------------------------
 
@@ -464,6 +594,84 @@ class LLMProvider:
 
         return "Offline mode: no matching fallback for the requested task."
 
+    def _detect_system_hardware(self) -> None:
+        """Detects and sets system hardware properties (CPU, RAM, GPU VRAM)."""
+        self.cpu_cores = self._detect_cpu_cores()
+        self.total_ram_gb = self._detect_total_ram_gb()
+        # self.max_vram_gb is already initialized, but we can try to improve it if possible
+        # by detecting GPU VRAM dynamically.
+        detected_vram = self._detect_gpu_vram_gb()
+        if detected_vram is not None:
+            self.max_vram_gb = min(self.max_vram_gb, detected_vram) # Use the lower of default/detected
+
+        logging.info(f"Detected hardware: CPU Cores: {self.cpu_cores}, Total RAM: {self.total_ram_gb} GB, Max VRAM: {self.max_vram_gb} GB")
+
+    def _detect_cpu_cores(self) -> int:
+        """Detects the number of logical CPU cores."""
+        try:
+            return psutil.cpu_count(logical=True) or 1
+        except Exception as e:
+            logging.warning(f"Could not detect CPU cores: {e}. Defaulting to 1.")
+            return 1
+
+    def _detect_total_ram_gb(self) -> int:
+        """Detects total system RAM in GB."""
+        try:
+            return int(psutil.virtual_memory().total / (1024**3))
+        except Exception as e:
+            logging.warning(f"Could not detect total RAM: {e}. Defaulting to {self.max_vram_gb} GB.")
+            return self.max_vram_gb
+
+    def _detect_gpu_vram_gb(self) -> Optional[int]:
+        """
+        Detects total GPU VRAM in GB using OS-specific commands.
+        Returns None if detection fails or no suitable GPU is found.
+        """
+        system = platform.system()
+        try:
+            if system == "Windows":
+                # Use wmic for Windows
+                result = subprocess.run(
+                    ["wmic", "path", "Win32_VideoController", "get", "AdapterRAM"],
+                    capture_output=True,
+                    text=True,
+                    check=False, # Do not raise CalledProcessError
+                    creationflags=subprocess.CREATE_NO_WINDOW # Hide console window
+                )
+                if result.returncode == 0 and "AdapterRAM" in result.stdout:
+                    # Parse output, typically like: "AdapterRAM\n1073741824\n"
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines:
+                        if line.strip().isdigit():
+                            ram_bytes = int(line.strip())
+                            return int(ram_bytes / (1024**3))
+            elif system == "Linux" or system == "Darwin": # Linux and macOS
+                # Try nvidia-smi first
+                if shutil.which("nvidia-smi"):
+                    result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    if result.returncode == 0:
+                        vram_mib = int(result.stdout.strip().split('\n')[0])
+                        return int(vram_mib / 1024)
+                # Fallback for other GPUs or if nvidia-smi not found (e.g., AMD, Intel)
+                # This is more complex and less reliable without specific tools.
+                # For now, we'll log a warning and return None.
+                logging.warning(
+                    f"Could not detect GPU VRAM for {system}. "
+                    "nvidia-smi not found or failed. "
+                    "Manual detection for other GPUs (AMD/Intel) is not yet implemented. "
+                    "Defaulting to configured max_vram_gb."
+                )
+            else:
+                logging.warning(f"Unsupported operating system for GPU VRAM detection: {system}")
+        except Exception as e:
+            logging.warning(f"Error during GPU VRAM detection: {e}")
+        return None
+
     def _extract_task_from_prompt(self, prompt: str) -> str:
         """
         Best-effort extraction of the task description from the orchestrator prompt.
@@ -472,6 +680,28 @@ class LLMProvider:
         if match:
             return match.group(1).strip()
         return prompt.strip()
+
+    def _get_model_info_from_benchmarks(self) -> Dict[str, Dict[str, Union[int, float]]]:
+        """
+        Loads model benchmark data from a JSON file. This simulates a "remote benchmark lookup".
+        """
+        if hasattr(self, "_benchmark_cache"):
+            return self._benchmark_cache
+
+        benchmark_file_path = self.project_root / ".autodev" / "lm_studio_model_benchmarks.json"
+        if not benchmark_file_path.exists():
+            logging.warning(f"Benchmark file not found: {benchmark_file_path}")
+            self._benchmark_cache = {}
+            return {}
+
+        try:
+            with open(benchmark_file_path, "r", encoding="utf-8") as f:
+                self._benchmark_cache = json.load(f)
+                return self._benchmark_cache
+        except Exception as e:
+            logging.error(f"Error loading model benchmarks from {benchmark_file_path}: {e}")
+            self._benchmark_cache = {}
+            return {}
 
     def _implement_dice_roller(self) -> str:
         """
