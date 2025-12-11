@@ -23,6 +23,17 @@ class LLMProvider:
         self.lmstudio_context_limit = int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", "4096"))
         self.lmstudio_max_tokens = max(128, int(os.getenv("LMSTUDIO_MAX_TOKENS", "1024")))
         self.lmstudio_timeout_seconds = int(os.getenv("LMSTUDIO_TIMEOUT_SECONDS", "30"))
+        self.lmstudio_base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234")
+        self.lmstudio_health_timeout = int(os.getenv("LMSTUDIO_HEALTH_TIMEOUT", "5"))
+        self.lmstudio_retries = max(1, int(os.getenv("LMSTUDIO_RETRIES", "2")))
+        # Optional overrides (by task or general)
+        self.lmstudio_model_overrides = {
+            "plan": os.getenv("LMSTUDIO_MODEL_PLAN"),
+            "code": os.getenv("LMSTUDIO_MODEL_CODE"),
+            "troubleshoot": os.getenv("LMSTUDIO_MODEL_TROUBLESHOOT"),
+            "any": os.getenv("LMSTUDIO_MODEL"),
+        }
+        self._lmstudio_model_cache: Tuple[float, List[str]] = (0.0, [])
 
     def plan(self, prompt: str) -> Optional[Dict]:
         if self.offline_mode:
@@ -227,11 +238,11 @@ class LLMProvider:
             return False, None
 
     def _try_lmstudio(self, prompt: str, task_type: str) -> Optional[str]:
-        model = self._select_model_for_lmstudio(task_type)
+        available_models = self._lmstudio_available_models()
+        model = self._select_model_for_lmstudio(task_type, available_models)
         if not model:
             return None
 
-        base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234")
         timeout = self.lmstudio_timeout_seconds
         ctx_windows = [self.lmstudio_context_limit]
         # second pass with a smaller window for aggressive trimming if the first fails
@@ -241,46 +252,55 @@ class LLMProvider:
         try:
             import requests
 
-            url = f"{base_url.rstrip('/')}/v1/chat/completions"
+            url = f"{self.lmstudio_base_url.rstrip('/')}/v1/chat/completions"
             headers = {"Content-Type": "application/json"}
             last_error: Optional[Exception] = None
-
-            for ctx in ctx_windows:
-                safe_prompt, trimmed = self._trim_prompt_for_lmstudio(prompt, ctx)
-                if trimmed:
-                    logging.warning(
-                        "LM Studio prompt trimmed to fit %s token context window (original ~%s tokens)",
-                        ctx,
-                        self._approx_token_count(prompt),
-                    )
-                data = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": safe_prompt}],
-                    "max_tokens": self.lmstudio_max_tokens,
-                    "temperature": 0.15,
-                    "stream": False,
-                }
-                try:
-                    response = requests.post(
-                        url, headers=headers, json=data, timeout=timeout
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                    return payload["choices"][0]["message"]["content"]
-                except requests.exceptions.RequestException as e:
-                    last_error = e
-                    # Retry once more with a smaller prompt if we hit a context issue
-                    if self._looks_like_context_error(e) and ctx != ctx_windows[-1]:
-                        logging.error(
-                            "LM Studio reported context overflow; retrying with a smaller prompt"
+            for attempt in range(self.lmstudio_retries):
+                for ctx in ctx_windows:
+                    safe_prompt, trimmed = self._trim_prompt_for_lmstudio(prompt, ctx)
+                    if trimmed:
+                        logging.warning(
+                            "LM Studio prompt trimmed to fit %s token context window (original ~%s tokens)",
+                            ctx,
+                            self._approx_token_count(prompt),
                         )
-                        continue
-                    logging.error(f"LM Studio request failed: {e}")
-                    break
-                except (KeyError, ValueError, TypeError) as e:
-                    last_error = e
-                    logging.error(f"Failed to parse LM Studio response: {e}")
-                    break
+                    data = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": safe_prompt}],
+                        "max_tokens": self.lmstudio_max_tokens,
+                        "temperature": 0.15,
+                        "stream": False,
+                    }
+                    try:
+                        response = requests.post(
+                            url, headers=headers, json=data, timeout=timeout
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                        return payload["choices"][0]["message"]["content"]
+                    except requests.exceptions.RequestException as e:
+                        last_error = e
+                        # Retry once more with a smaller prompt if we hit a context issue
+                        if self._looks_like_context_error(e) and ctx != ctx_windows[-1]:
+                            logging.error(
+                                "LM Studio reported context overflow; retrying with a smaller prompt"
+                            )
+                            continue
+                        logging.error(
+                            "LM Studio request failed (attempt %s/%s): %s",
+                            attempt + 1,
+                            self.lmstudio_retries,
+                            e,
+                        )
+                        break
+                    except (KeyError, ValueError, TypeError) as e:
+                        last_error = e
+                        logging.error(f"Failed to parse LM Studio response: {e}")
+                        break
+
+                if last_error:
+                    # Backoff between attempts
+                    time.sleep(min(2 * (attempt + 1), 5))
 
             if last_error:
                 logging.error("LM Studio unavailable after retries: %s", last_error)
@@ -288,7 +308,66 @@ class LLMProvider:
             logging.error(f"An unexpected error occurred with LM Studio: {e}")
         return None
 
-    def _select_model_for_lmstudio(self, task_type: str) -> Optional[str]:
+    def _lmstudio_available_models(self) -> List[str]:
+        """
+        Query LM Studio for available models. Caches results briefly to avoid
+        spamming the local API.
+        """
+        now = time.time()
+        cached_at, cached_models = self._lmstudio_model_cache
+        if cached_models and (now - cached_at) < 30:
+            return cached_models
+
+        try:
+            import requests
+
+            url = f"{self.lmstudio_base_url.rstrip('/')}/v1/models"
+            resp = requests.get(url, timeout=self.lmstudio_health_timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [
+                item.get("id")
+                for item in data.get("data", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            self._lmstudio_model_cache = (now, models)
+            return models
+        except Exception as exc:
+            logging.error(
+                "LM Studio health check failed (%s). Is LM Studio running with the local server enabled?",
+                exc,
+            )
+            return []
+
+    def _required_vram_for_model(self, model: str, vram_requirements: Dict[str, int]) -> int:
+        """
+        Heuristic VRAM estimator: prefer explicit mappings, otherwise derive from tokens like 7B/8B.
+        """
+        if model in vram_requirements:
+            return vram_requirements[model]
+
+        tokens = re.split(r"[^\w]+", model.lower())
+        for token in tokens:
+            if token.endswith("b") and token[:-1].isdigit():
+                size = int(token[:-1])
+                if size <= 7:
+                    return 4
+                if size == 8:
+                    return 5
+                if size == 9:
+                    return 6
+                if size >= 13:
+                    return 10
+        return self.max_vram_gb + 1
+
+    def _get_model_override(self, task_type: str) -> Optional[str]:
+        # Re-read env on each call so runtime overrides are honored
+        task_key = f"LMSTUDIO_MODEL_{task_type.upper()}"
+        return os.getenv(task_key) or os.getenv("LMSTUDIO_MODEL")
+
+    def _select_model_for_lmstudio(
+        self, task_type: str, available_models: Optional[List[str]] = None
+    ) -> Optional[str]:
         models = {
             "plan": ["rnj-1", "Hermes 2 Pro 7B", "Mistral 7B", "Nous-Hermes 2 7B"],
             "code": ["rnj-1", "Qwen2.5 Coder 7B", "StarCoder 7B", "CodeGemma 7B"],
@@ -303,13 +382,30 @@ class LLMProvider:
             "rnj-1": 8,
         }
 
+        # Task-specific or global override takes priority
+        override = self._get_model_override(task_type)
+        if override:
+            if available_models and override not in available_models:
+                logging.warning(
+                    "Requested LM Studio model '%s' not found in available models %s; falling back to defaults",
+                    override,
+                    available_models,
+                )
+            else:
+                return override
+
+        available_models = available_models or []
+
         for model in models.get(task_type, []):
-            # Prefer an explicit match, otherwise fall back to the trailing token
-            size_token = model.split()[-1]
-            required_vram = vram_requirements.get(
-                model,
-                vram_requirements.get(size_token, self.max_vram_gb + 1),
-            )
+            required_vram = self._required_vram_for_model(model, vram_requirements)
+            if required_vram <= self.max_vram_gb:
+                if available_models and model not in available_models:
+                    continue
+                return model
+
+        # As a last resort, pick any available model that fits VRAM
+        for model in available_models:
+            required_vram = self._required_vram_for_model(model, vram_requirements)
             if required_vram <= self.max_vram_gb:
                 return model
 
