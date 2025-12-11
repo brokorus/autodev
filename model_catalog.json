@@ -1,0 +1,80 @@
+[
+  {
+    "modelKey": "ibm/granite-4-h-tiny",
+    "benchmarks": {
+      "plan": 92,
+      "code": 89,
+      "troubleshoot": 91,
+      "summary": 85,
+      "default": 80
+    },
+    "vram_gb": 7,
+    "context_length": 1048576,
+    "notes": "IBM hybrid model optimized for planner/reasoning workloads."
+  },
+  {
+    "modelKey": "essentialai/rnj-1",
+    "benchmarks": {
+      "plan": 90,
+      "code": 95,
+      "troubleshoot": 92,
+      "summary": 88,
+      "default": 88
+    },
+    "vram_gb": 8.5,
+    "context_length": 32768,
+    "notes": "Gemma 3 base tuned for tool reasoning."
+  },
+  {
+    "modelKey": "google/gemma-3-12b",
+    "benchmarks": {
+      "plan": 88,
+      "code": 93,
+      "troubleshoot": 87,
+      "summary": 86,
+      "default": 85
+    },
+    "vram_gb": 11,
+    "context_length": 131072,
+    "notes": "Large-context Gemma used when VRAM is generous."
+  },
+  {
+    "modelKey": "phi-3-mini-128k-instruct-imatrix-smashed",
+    "benchmarks": {
+      "plan": 83,
+      "code": 84,
+      "troubleshoot": 82,
+      "summary": 88,
+      "default": 80
+    },
+    "vram_gb": 4,
+    "context_length": 131072,
+    "notes": "Smaller Phi model with extended context."
+  },
+  {
+    "modelKey": "phi-4-mini-reasoning",
+    "benchmarks": {
+      "plan": 87,
+      "code": 86,
+      "troubleshoot": 85,
+      "summary": 80,
+      "default": 82
+    },
+    "vram_gb": 3,
+    "context_length": 65536,
+    "notes": "Efficient Phi-3 derived reasoning model."
+  },
+  {
+    "modelKey": "deepseek/deepseek-r1-0528-qwen3-8b",
+    "benchmarks": {
+      "plan": 85,
+      "code": 88,
+      "troubleshoot": 83,
+      "summary": 80,
+      "default": 80
+    },
+    "vram_gb": 6.5,
+    "context_length": 131072,
+    "notes": "Qwen3-based model tuned for coding."
+  }
+]

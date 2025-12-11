@@ -1,0 +1,56 @@
+{
+    "Hermes 2 Pro 7B": {
+        "vram_gb": 5,
+        "ram_gb": 8,
+        "performance_score": 0.8,
+        "context_window": 4096
+    },
+    "Mistral 7B": {
+        "vram_gb": 4,
+        "ram_gb": 7,
+        "performance_score": 0.75,
+        "context_window": 8192
+    },
+    "Nous-Hermes 2 7B": {
+        "vram_gb": 5,
+        "ram_gb": 8,
+        "performance_score": 0.82,
+        "context_window": 4096
+    },
+    "Qwen2.5 Coder 7B": {
+        "vram_gb": 6,
+        "ram_gb": 10,
+        "performance_score": 0.85,
+        "context_window": 8192
+    },
+    "StarCoder 7B": {
+        "vram_gb": 6,
+        "ram_gb": 10,
+        "performance_score": 0.8,
+        "context_window": 8192
+    },
+    "CodeGemma 7B": {
+        "vram_gb": 5,
+        "ram_gb": 9,
+        "performance_score": 0.83,
+        "context_window": 8192
+    },
+    "MixtralInstruct 8x7B": {
+        "vram_gb": 12,
+        "ram_gb": 24,
+        "performance_score": 0.9,
+        "context_window": 32768
+    },
+    "rnj-1": {
+        "vram_gb": 8,
+        "ram_gb": 16,
+        "performance_score": 0.88,
+        "context_window": 4096
+    },
+    "TinyLlama-1.1B": {
+        "vram_gb": 1,
+        "ram_gb": 2,
+        "performance_score": 0.5,
+        "context_window": 2048
+    }
+}
