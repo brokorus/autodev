@@ -28,20 +28,40 @@ function Confirm-Overwrite {
     )
 
     if (-not (Test-Path $Path)) {
-        return
+        return $true
     }
 
     if ($Force) {
-        Remove-Item -Recurse -Force $Path
-        return
+        return $true
     }
 
     $answer = Read-Host "Found existing $Path. Overwrite? (y/N)"
     if ($answer -match '^(y|yes)$') {
-        Remove-Item -Recurse -Force $Path
-    } else {
-        throw "Aborted at user request; leaving $Path unchanged."
+        return $true
     }
+
+    throw "Aborted at user request; leaving $Path unchanged."
+}
+
+function Refresh-Autodev {
+    param(
+        [string]$SourceAutodev,
+        [string]$DestAutodev
+    )
+
+    $proceed = Confirm-Overwrite -Path $DestAutodev
+    if (-not $proceed) { return }
+
+    if (-not (Test-Path $DestAutodev)) {
+        New-Item -ItemType Directory -Path $DestAutodev -Force | Out-Null
+    }
+
+    # Preserve any existing venv to avoid locked-file issues and speed re-installs.
+    Get-ChildItem -Path $DestAutodev -Force | Where-Object { $_.Name -ne "venv" } | ForEach-Object {
+        Remove-Item -Recurse -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue
+    }
+
+    Copy-Item -Path (Join-Path $SourceAutodev "*") -Destination $DestAutodev -Recurse -Force
 }
 
 $targetRoot = (Get-Location).ProviderPath
@@ -61,16 +81,16 @@ try {
     }
 
     $destAutodev = Join-Path $targetRoot ".autodev"
-    Confirm-Overwrite -Path $destAutodev
-    New-Item -ItemType Directory -Path $destAutodev -Force | Out-Null
-    Copy-Item -Path (Join-Path $sourceAutodev "*") -Destination $destAutodev -Recurse -Force
+    Refresh-Autodev -SourceAutodev $sourceAutodev -DestAutodev $destAutodev
 
     foreach ($file in @("start-autodev.ps1", "AUTODEV_README.md")) {
         $sourceFile = Join-Path $tempDir $file
         if (Test-Path $sourceFile) {
             $destFile = Join-Path $targetRoot $file
-            Confirm-Overwrite -Path $destFile
-            Copy-Item -Path $sourceFile -Destination $destFile -Force
+            $ok = Confirm-Overwrite -Path $destFile
+            if ($ok) {
+                Copy-Item -Path $sourceFile -Destination $destFile -Force
+            }
         }
     }
 
