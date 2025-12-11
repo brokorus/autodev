@@ -16,10 +16,13 @@ sys.path.append(str(AUTODEV))
 
 from llm_provider import LLMProvider
 from codex_cli import resolve_codex_command
+from state import AutoDevState
 
 
 LOGS = AUTODEV / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
+PM_DIR = AUTODEV / "pm"
+PM_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_TIMEOUT = int(os.getenv("AUTODEV_CODER_TIMEOUT", "900"))
 DEFAULT_TEST_TIMEOUT = int(os.getenv("AUTODEV_TEST_TIMEOUT", "900"))
 CHECKPOINT_LOG = LOGS / "checkpoints.jsonl"
@@ -251,6 +254,33 @@ def snapshot(base: Path = BASE, max_chars: int = 60_000) -> str:
     return "\n".join(chunks)
 
 
+def derive_expertise(task: dict) -> str:
+    """
+    Heuristic to steer the coder persona toward the right discipline.
+    """
+    text = (task.get("task") or "").lower()
+    tests = " ".join(task.get("tests") or []).lower()
+    combined = f"{text} {tests}"
+    if any(word in combined for word in ["playwright", "svelte", "frontend", "ui", "ux"]):
+        return "Staff frontend+UX engineer pairing with QA"
+    if any(word in combined for word in ["infra", "cloudflare", "deployment", "actions", "ci"]):
+        return "Staff reliability + DevOps engineer"
+    if "api" in combined or "backend" in combined:
+        return "Staff backend engineer with API hardening focus"
+    return "Principal full-stack engineer"
+
+
+def summarize_board(state: AutoDevState, max_chars: int = 2000) -> str:
+    """
+    Provide a compact PM snapshot to the coder to avoid repeated attempts.
+    """
+    try:
+        raw = state.board_file.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return raw[:max_chars]
+
+
 def _detect_playwright_config(base: Path) -> bool:
     for name in ("playwright.config.ts", "playwright.config.js", "playwright.config.mjs"):
         if (base / name).exists():
@@ -412,7 +442,7 @@ def codex(prompt: str, sandbox: str = "workspace-write") -> str:
     return proc.stdout
 
 
-def implement(task: dict) -> str:
+def implement(task: dict, board_snapshot: str, expertise: str) -> str:
     llm_provider = LLMProvider()
     autodev_readme = load_autodev_readme()
     prompt = """
@@ -422,12 +452,16 @@ AUTODEV_README (system overview):
 {autodev_readme}
 
 You are the CODER.
+Operate as: {expertise}
 
 TASK:
 {task}
 
 TESTS:
 {tests}
+
+Project board snapshot (recent tickets, failures):
+{board_snapshot}
 
 Work in the project root: {base}
 
@@ -447,6 +481,8 @@ Requirements:
         autodev_readme=autodev_readme or "No AUTODEV_README.md provided.",
         task=task["task"],
         tests=json.dumps(task["tests"], indent=2),
+        board_snapshot=board_snapshot or "No tickets logged yet.",
+        expertise=expertise,
         base=BASE,
     )
     return llm_provider.code(prompt)
@@ -504,6 +540,7 @@ def main() -> None:
         print("Warning: not inside a git repository; checkpoints will be skipped.")
 
     iteration = 0
+    state = AutoDevState(PM_DIR)
     while True:
         iteration += 1
         print("\n=== Iteration {} ===".format(iteration))
@@ -531,11 +568,7 @@ def main() -> None:
                 time.sleep(30)
                 continue
 
-            print(
-                "Planner produced {} backlog item(s). Ordering by priority...".format(
-                    len(backlog)
-                )
-            )
+            print("Planner produced {} backlog item(s).".format(len(backlog)))
             actionable = []
             blocked = []
             for idx, item in enumerate(backlog, start=1):
@@ -571,6 +604,8 @@ def main() -> None:
                     if resources:
                         print("  Infra needs: {}".format(", ".join(resources)))
 
+            state.sync_backlog(backlog, blocked)
+            state.render_board()
             if not actionable:
                 print(
                     "Planner did not produce an actionable task (all blocked by prerequisites or cost). Sleeping..."
@@ -588,7 +623,13 @@ def main() -> None:
                 time.sleep(60)
                 continue
 
-            task = sorted(actionable, key=lambda x: x.get("priority", 1000))[0]
+            next_item = state.next_actionable()
+            if not next_item:
+                print("No actionable tasks in the board after syncing backlog. Sleeping...")
+                time.sleep(30)
+                continue
+
+            task_id, task = next_item
             print("\nSelected task (highest priority):")
             print("  Task:", task.get("task"))
             if task.get("idea"):
@@ -603,10 +644,12 @@ def main() -> None:
             )
 
             task_label = (task.get("task") or "task").strip()
+            state.mark_in_progress(task_id, iteration)
             pre_meta = {
                 "iteration": iteration,
                 "phase": "pre-change",
                 "task": task_label,
+                "id": task_id,
             }
             pre_checkpoint = git_cp.create_checkpoint(
                 f"iteration {iteration} pre-change: {task_label}",
@@ -616,7 +659,8 @@ def main() -> None:
             if pre_checkpoint:
                 print(f"Checkpoint captured before changes: {pre_checkpoint}")
 
-            result = implement(task)
+            board_snapshot = summarize_board(state)
+            result = implement(task, board_snapshot, derive_expertise(task))
             print(result)
 
             log_path = LOGS / "run_{}.log".format(iteration)
@@ -638,10 +682,20 @@ def main() -> None:
             else:
                 print("No test commands detected/configured; skipping test run.")
 
+            if test_outcome.get("all_passed", True):
+                state.mark_done(task_id, iteration, test_outcome)
+            else:
+                state.mark_failed(task_id, iteration, test_outcome)
+                fix_tasks = state.create_fix_tasks(task_id, task_label, test_outcome)
+                if fix_tasks:
+                    state.add_tasks(fix_tasks)
+                    print("Added {} remediation task(s) based on failing tests.".format(len(fix_tasks)))
+
             post_meta = {
                 "iteration": iteration,
                 "phase": "post-change",
                 "task": task_label,
+                "id": task_id,
                 "tests_passed": test_outcome.get("all_passed", True),
                 "test_commands": [r["command"] for r in test_outcome.get("results", [])],
                 "test_log": test_outcome.get("log_file"),

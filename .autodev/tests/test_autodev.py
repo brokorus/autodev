@@ -19,6 +19,8 @@ def load_module(name: str, path: Path):
 
 planner = load_module("planner", BASE / "planner.py")
 orchestrator = load_module("orchestrator", BASE / "orchestrator.py")
+state_mod = load_module("state", BASE / "state.py")
+AutoDevState = state_mod.AutoDevState
 
 
 class PlannerTests(unittest.TestCase):
@@ -118,6 +120,77 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(outcome["ran"])
         self.assertFalse(outcome["all_passed"])
         self.assertNotEqual(outcome["results"][0]["returncode"], 0)
+
+
+class StateTests(unittest.TestCase):
+    def test_state_tracks_fix_tasks_and_board(self):
+        tmp = Path(tempfile.mkdtemp())
+        pm_dir = tmp / "pm"
+        state = AutoDevState(pm_dir)
+
+        backlog = [
+            {
+                "task": "Ship feature X",
+                "tests": ["npm test"],
+                "priority": 1,
+                "prerequisites": {"met": True, "missing": []},
+            }
+        ]
+        state.sync_backlog(backlog, [])
+        state.render_board()
+        board_path = pm_dir / "board.md"
+        self.assertTrue(board_path.exists())
+
+        task_id, task = state.next_actionable()
+        fake_outcome = {
+            "ran": True,
+            "all_passed": False,
+            "results": [
+                {"command": "npm test", "returncode": 1, "stdout": "", "stderr": "failed test", "duration_seconds": 1}
+            ],
+        }
+        state.mark_failed(task_id, 1, fake_outcome)
+        fixes = state.create_fix_tasks(task_id, task["task"], fake_outcome)
+        state.add_tasks(fixes)
+
+        self.assertGreaterEqual(len(fixes), 1)
+        next_id, next_task = state.next_actionable()
+        self.assertTrue(next_id.startswith(task_id))
+        self.assertEqual(next_task["status"], "todo")
+
+        # Export files should exist and be non-empty
+        linear = pm_dir / "export" / "linear.csv"
+        jira = pm_dir / "export" / "jira.csv"
+        tw = pm_dir / "export" / "taskwarrior.jsonl"
+        self.assertTrue(linear.exists())
+        self.assertTrue(jira.exists())
+        self.assertTrue(tw.exists())
+        self.assertGreater(len(linear.read_text()), 0)
+        self.assertGreater(len(tw.read_text()), 0)
+
+    def test_export_can_filter_formats(self):
+        tmp = Path(tempfile.mkdtemp())
+        pm_dir = tmp / "pm"
+        state = AutoDevState(pm_dir)
+        state.add_tasks(
+            [
+                {
+                    "task": "Filter export test",
+                    "tests": [],
+                    "priority": 1,
+                    "prerequisites": {"met": True, "missing": []},
+                }
+            ]
+        )
+        # Clear any auto-generated exports from previous saves
+        export_dir = pm_dir / "export"
+        if export_dir.exists():
+            for f in export_dir.glob("*"):
+                f.unlink()
+        written = state.export(["linear"])
+        self.assertTrue(any(str(p).endswith("linear.csv") for p in written))
+        self.assertFalse((pm_dir / "export" / "jira.csv").exists())
+        self.assertFalse((pm_dir / "export" / "taskwarrior.jsonl").exists())
 
 
 if __name__ == "__main__":

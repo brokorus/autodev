@@ -50,7 +50,7 @@ confirm_overwrite "$TARGET/.autodev"
 mkdir -p "$TARGET/.autodev"
 cp -R "$tmp/.autodev/." "$TARGET/.autodev"
 
-for file in start-autodev.ps1 AUTODEV_README.md; do
+for file in autodev.ps1 AUTODEV_README.md; do
   if [[ -f "$tmp/$file" ]]; then
     confirm_overwrite "$TARGET/$file"
     cp "$tmp/$file" "$TARGET/$file"
@@ -61,6 +61,6 @@ info "AutoDev files copied."
 echo
 echo "Next steps:"
 echo "1) Review .autodev/requirements-autodev.txt if you want to pin/adjust packages."
-echo "2) Run ./start-autodev.ps1 with PowerShell (pwsh or powershell) to bootstrap AutoDev."
+echo "2) Run ./autodev.ps1 with PowerShell (pwsh or powershell) to bootstrap AutoDev."
 echo
 echo "Tip: set AUTODEV_FORCE=1 to overwrite without prompting."

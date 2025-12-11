@@ -83,7 +83,7 @@ try {
     $destAutodev = Join-Path $targetRoot ".autodev"
     Refresh-Autodev -SourceAutodev $sourceAutodev -DestAutodev $destAutodev
 
-    foreach ($file in @("start-autodev.ps1", "AUTODEV_README.md")) {
+    foreach ($file in @("autodev.ps1", "AUTODEV_README.md")) {
         $sourceFile = Join-Path $tempDir $file
         if (Test-Path $sourceFile) {
             $destFile = Join-Path $targetRoot $file
@@ -98,7 +98,7 @@ try {
     Write-Host ""
     Write-Host "Next steps:"
     Write-Host "1) Review .autodev/requirements-autodev.txt if you want to pin/adjust packages."
-    Write-Host "2) Run ./start-autodev.ps1 (PowerShell) from this repo to bootstrap and start AutoDev."
+    Write-Host "2) Run ./autodev.ps1 (PowerShell) from this repo to bootstrap and start AutoDev."
     Write-Host ""
     Write-Host "Tip: re-run this installer later with -Force to refresh AutoDev from $Repo."
 }
