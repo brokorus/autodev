@@ -121,6 +121,13 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(outcome["all_passed"])
         self.assertNotEqual(outcome["results"][0]["returncode"], 0)
 
+    def test_coerce_backlog_injects_synthetic_on_halt(self):
+        data = {"halt_reason": "no code", "backlog": []}
+        backlog, halt = orchestrator.coerce_backlog(data)
+        self.assertTrue(backlog)
+        self.assertEqual(halt, "no code")
+        self.assertIn("Audit repository structure", backlog[0]["task"])
+
 
 class StateTests(unittest.TestCase):
     def test_state_tracks_fix_tasks_and_board(self):

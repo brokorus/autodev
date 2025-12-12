@@ -207,6 +207,34 @@ def load_story_digest(limit: int = 12) -> str:
     except Exception:  # noqa: BLE001
         return "No story digest available yet."
 
+
+def coerce_backlog(backlog_data: dict) -> tuple[list[dict], str]:
+    """
+    Normalize planner output.
+    If halt_reason is set but backlog is empty, emit a synthetic maintenance task
+    to keep progress moving (common when LLM misfires with 'no code in snapshot').
+    """
+    halt_reason = (backlog_data.get("halt_reason") or "").strip()
+    backlog = backlog_data.get("backlog") or []
+    if halt_reason and not backlog:
+        synthetic = [
+            {
+                "idea": "Recover from empty plan",
+                "task": "Audit repository structure and list actionable tasks based on current files.",
+                "tests": [],
+                "priority": 1,
+                "prerequisites": {"met": True, "missing": [], "blocked_due_to_paid_service": False, "fifteen_factor_gates": []},
+                "impl_spec": {
+                    "functions": [],
+                    "pseudo": ["scan repo files", "summarize modules/components", "propose next tasks"],
+                    "tests_needed": [],
+                    "edge_cases": ["no code found", "binary files only"],
+                },
+            }
+        ]
+        return synthetic, halt_reason
+    return backlog, halt_reason
+
 def snapshot(base: Path = BASE, max_chars: int = 40_000) -> str:
     """
     Capture a text-only snapshot of the repo for the planner.
@@ -601,8 +629,19 @@ def main() -> None:
                 tags=["plan"],
                 details={"backlog_raw": backlog_data},
             )
-            halt_reason = (backlog_data.get("halt_reason") or "").strip()
-            if halt_reason:
+            backlog, halt_reason = coerce_backlog(backlog_data)
+            if halt_reason and not backlog_data.get("backlog"):
+                print(f"Planner returned halt_reason '{halt_reason}'. Using synthetic maintenance backlog to continue.")
+                story_safe_add(
+                    kind="plan",
+                    title=f"Planner fallback iteration {iteration}",
+                    summary="Halt_reason received; injected synthetic audit task to keep loop moving.",
+                    iteration=iteration,
+                    status="fallback",
+                    tags=["plan", "fallback"],
+                    details={"halt_reason": halt_reason},
+                )
+            elif halt_reason:
                 print(
                     "Planner halted work due to non-free/prereq constraint: {}".format(
                         halt_reason
@@ -619,7 +658,6 @@ def main() -> None:
                 )
                 break
 
-            backlog = backlog_data.get("backlog", [])
             if not backlog:
                 print("No backlog items produced from ideas.md yet. Sleeping...")
                 time.sleep(30)

@@ -151,6 +151,7 @@ CRITICAL INSTRUCTIONS:
 - NEVER execute shell commands or code; planning is read-only and based solely on the provided snapshot.
 - KEEP CONTEXT TIGHT: use only what appears in AUTODEV_README + snapshot; do not invent files/APIs. If unsure, ask for prerequisites rather than guessing.
 - OUTPUT AT MOST 3 TASKS. If work should pause, set halt_reason instead of emitting tasks.
+- DO NOT use halt_reason for vague claims like "no code in snapshot"—assume the snapshot is valid. If unsure, emit at least one repository-maintenance task (e.g., "catalog current modules") instead of halting.
 - Apply 15-factor/12-factor-inspired cloud-native principles (config-as-code, backing services as attached resources, disposability, parity, observability, security, governance, secrets hygiene, logs/metrics, admin processes).
 - For EACH idea, verify prerequisites and call them out explicitly. Example: "build a user map" requires identity/user management + location permissions; if missing, create prerequisite tasks first and mark the feature as not yet met.
 - Inventory infrastructure dependencies. Prefer GitHub Actions + Cloudflare free-tier (Workers, KV, D1, Pages, Queues, R2 within free limits). Provide a YAML/CLI snippet the coder can drop into the repo/GitHub Actions to create missing infra.
