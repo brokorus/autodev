@@ -166,6 +166,19 @@ class TestLLMProvider(unittest.TestCase):
         os.environ.pop("LMSTUDIO_MODEL_CODE", None)
 
     @patch('requests.get')
+    @patch('llm_provider.LLMProvider._try_lmstudio')
+    def test_local_only_skips_gemini(self, mock_try_lm, mock_get):
+        os.environ["AUTODEV_LOCAL_ONLY"] = "1"
+        provider = LLMProvider()
+        mock_get.return_value = Mock(json=lambda: {"data": []}, raise_for_status=lambda: None)
+        provider.gemini_path = "/fake/gemini"
+        mock_try_lm.return_value = '{"backlog": []}'
+        result = provider.plan("prompt")
+        self.assertEqual(result, {"backlog": []})
+        mock_try_lm.assert_called_once()
+        os.environ.pop("AUTODEV_LOCAL_ONLY", None)
+
+    @patch('requests.get')
     def test_lmstudio_falls_back_to_available_model(self, mock_get):
         provider = LLMProvider()
         provider.max_vram_gb = 16

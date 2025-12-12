@@ -1,4 +1,5 @@
 
+import atexit
 import psutil
 import shutil
 import json
@@ -18,17 +19,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class LLMProvider:
     def __init__(self, max_vram_gb: int = 8):
         # Maximum VRAM in GB available for models. Used to filter suitable LM Studio models.
+        self.configured_vram_gb = max_vram_gb
+        cap_env = os.getenv("LMSTUDIO_VRAM_CAP_GB", "0")
+        self.vram_cap_gb = int(cap_env) if cap_env.isdigit() and int(cap_env) > 0 else None
         self.max_vram_gb = max_vram_gb
+        # Local-only flag (skip hosted Gemini/remote calls)
+        local_flag = os.getenv("AUTODEV_LOCAL_ONLY", "").lower()
+        self.local_only = local_flag in {"1", "true", "yes"}
         # Path to the Gemini CLI executable. Discovered dynamically.
         self.gemini_path = self._find_gemini_cli()
+        # Path to the LM Studio CLI (lms). Discovered dynamically.
+        self.lms_path = self._find_lms_cli()
         # The root directory of the project, used for resolving paths to app resources.
         self.project_root = Path(__file__).resolve().parent.parent
         # Determine if AutoDev is running in offline mode based on environment variable.
         offline_flag = os.getenv("AUTODEV_OFFLINE_MODE", "").lower()
         self.offline_mode = offline_flag in {"1", "true", "yes"}
         # LM Studio configuration parameters, loaded from environment variables or default values.
-        self.lmstudio_context_limit = int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", "4096"))
-        self.lmstudio_max_tokens = max(128, int(os.getenv("LMSTUDIO_MAX_TOKENS", "1024")))
+        # Defaults of 0 mean "let the model decide" instead of enforcing low ceilings; we apply
+        # a sensible runtime default (e.g., 8192) when loading a model to avoid tiny contexts.
+        self.lmstudio_context_limit = int(os.getenv("LMSTUDIO_CONTEXT_WINDOW", "0"))
+        self.lmstudio_max_tokens = int(os.getenv("LMSTUDIO_MAX_TOKENS", "0"))
         self.lmstudio_timeout_seconds = int(os.getenv("LMSTUDIO_TIMEOUT_SECONDS", "30"))
         self.lmstudio_base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234")
         self.lmstudio_health_timeout = int(os.getenv("LMSTUDIO_HEALTH_TIMEOUT", "5"))
@@ -42,11 +53,16 @@ class LLMProvider:
         }
         # Cache for LM Studio's available models to avoid frequent API calls. Stores (timestamp, list_of_models).
         self._lmstudio_model_cache: Tuple[float, List[str]] = (0.0, [])
+        self._closed = False
 
         # System hardware detection
         self.cpu_cores: int = 1
         self.total_ram_gb: int = max_vram_gb # Fallback for now
+        self._lmstudio_unload_all_models() # Unload any existing models for accurate VRAM detection
         self._detect_system_hardware()
+
+        # Ensure we clean up LM Studio models / HTTP activity on exit
+        atexit.register(self.close)
 
     def plan(self, prompt: str) -> Optional[Dict]:
         if self.offline_mode:
@@ -71,15 +87,32 @@ class LLMProvider:
 
         return self._try_provider(prompt, "troubleshoot")
 
-    def _try_provider(self, prompt: str, task_type: str) -> Optional[str]:
-        # Try Gemini first
-        if not self.gemini_path:
-            self.gemini_path = self._find_gemini_cli()
+    def close(self) -> None:
+        """Best-effort cleanup to avoid leaving LM Studio models loaded or HTTP polling alive."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._lmstudio_unload_all_models()
+        except Exception as exc:  # noqa: BLE001
+            logging.debug(f"Cleanup skipped: {exc}")
 
-        if self.gemini_path:
-            success, response = self._try_gemini(prompt)
-            if success:
-                return response
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def _try_provider(self, prompt: str, task_type: str) -> Optional[str]:
+        # Try Gemini first unless local-only is requested
+        if not self.local_only:
+            if not self.gemini_path:
+                self.gemini_path = self._find_gemini_cli()
+
+            if self.gemini_path:
+                success, response = self._try_gemini(prompt)
+                if success:
+                    return response
 
         # Fallback to LM Studio
         return self._try_lmstudio(prompt, task_type)
@@ -167,6 +200,33 @@ class LLMProvider:
 
         return None
 
+    def _find_lms_cli(self) -> Optional[str]:
+        """
+        Locates the LM Studio CLI executable (`lms`) on the system.
+        Checks common install locations first, then falls back to PATH lookup.
+        """
+        candidates: List[str] = []
+        system = platform.system()
+
+        # Default LM Studio CLI install locations
+        home = Path(os.path.expanduser("~"))
+        if system == "Windows":
+            candidates.append(str(home / ".lmstudio" / "bin" / "lms.exe"))
+            candidates.append(str(home / ".lmstudio" / "bin" / "lms.cmd"))
+        else:
+            candidates.append(str(home / ".lmstudio" / "bin" / "lms"))
+
+        # PATH lookup
+        for exe_name in ["lms.exe", "lms.cmd", "lms"]:
+            found = shutil.which(exe_name)
+            if found:
+                candidates.append(found)
+
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
     def _approx_token_count(self, text: str) -> int:
         """
         Very rough tokenizer approximation to keep LM Studio requests within the
@@ -174,6 +234,19 @@ class LLMProvider:
         style models closely enough for safety trimming.
         """
         return max(1, len(text) // 4)
+
+    def _effective_context_limit(self, prompt: str) -> int:
+        """
+        Decide what context length to request/load for LM Studio.
+        If LMSTUDIO_CONTEXT_WINDOW is set, honor it. Otherwise choose a generous
+        default based on the prompt size, capped to a sane upper bound to avoid
+        over-allocation.
+        """
+        tokens = self._approx_token_count(prompt)
+        if self.lmstudio_context_limit > 0:
+            return self.lmstudio_context_limit
+        # Default: enough for prompt + generation headroom, bounded to avoid huge loads
+        return min(16384, max(8192, tokens + 1024))
 
     def _trim_prompt_for_lmstudio(self, prompt: str, max_ctx_tokens: int) -> Tuple[str, bool]:
         """
@@ -274,18 +347,23 @@ class LLMProvider:
         trims the prompt if necessary to fit the context window, and retries the request
         if there are transient errors or context overflow issues.
         """
+        effective_ctx = self._effective_context_limit(prompt)
         available_models = self._lmstudio_available_models()
-        model = self._select_model_for_lmstudio(task_type, available_models)
+        model = self._select_model_for_lmstudio(task_type, available_models, estimate_ctx_tokens=effective_ctx)
         if not model:
             # Log a warning if no suitable LM Studio model could be selected.
             logging.warning("No suitable LM Studio model found or selected.")
             return None
 
+        # Make sure the model is loaded with an adequate context length and fits hardware.
+        if not self._lmstudio_prepare_model(model, prompt):
+            return None
+
         timeout = self.lmstudio_timeout_seconds
-        ctx_windows = [self.lmstudio_context_limit]
+        ctx_windows = [effective_ctx]
         # second pass with a smaller window for aggressive trimming if the first fails
-        if self.lmstudio_context_limit > 1024:
-            ctx_windows.append(max(1024, self.lmstudio_context_limit // 2))
+        if effective_ctx > 1024:
+            ctx_windows.append(max(1024, effective_ctx // 2))
 
         try:
             import requests
@@ -305,10 +383,11 @@ class LLMProvider:
                     data = {
                         "model": model,
                         "messages": [{"role": "user", "content": safe_prompt}],
-                        "max_tokens": self.lmstudio_max_tokens,
                         "temperature": 0.15,
                         "stream": False,
                     }
+                    if self.lmstudio_max_tokens > 0:
+                        data["max_tokens"] = self.lmstudio_max_tokens
                     try:
                         response = requests.post(
                             url, headers=headers, json=data, timeout=timeout
@@ -348,34 +427,285 @@ class LLMProvider:
 
     def _lmstudio_available_models(self) -> List[str]:
         """
-        Query LM Studio for available models. Caches results briefly to avoid
-        spamming the local API.
+        Query LM Studio for available models (downloaded/local). Prefer the lms
+        CLI because it works even if the HTTP server isn't started yet. Caches
+        results briefly to avoid spamming the local API.
         """
         now = time.time()
         cached_at, cached_models = self._lmstudio_model_cache
         if cached_models and (now - cached_at) < 30:
             return cached_models
 
-        try:
-            import requests
+        models: List[str] = []
 
-            url = f"{self.lmstudio_base_url.rstrip('/')}/v1/models"
-            resp = requests.get(url, timeout=self.lmstudio_health_timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            models = [
-                item.get("id")
-                for item in data.get("data", [])
-                if isinstance(item, dict) and item.get("id")
-            ]
-            self._lmstudio_model_cache = (now, models)
-            return models
-        except Exception as exc:
-            logging.error(
-                "LM Studio health check failed (%s). Is LM Studio running with the local server enabled?",
-                exc,
+        # Prefer lms CLI (works without HTTP server)
+        cli = self.lms_path or self._find_lms_cli()
+        if cli:
+            try:
+                result = subprocess.run(
+                    [cli, "ls", "--json"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    check=True,
+                )
+                data = json.loads(result.stdout or "[]")
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("identifier"):
+                            models.append(item["identifier"])
+            except Exception as exc:
+                logging.warning("lms ls failed (%s); falling back to HTTP /v1/models", exc)
+
+        if not models:
+            # Fallback to HTTP (requires LM Studio server running)
+            try:
+                import requests
+
+                url = f"{self.lmstudio_base_url.rstrip('/')}/v1/models"
+                resp = requests.get(url, timeout=self.lmstudio_health_timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                models = [
+                    item.get("id")
+                    for item in data.get("data", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+            except Exception as exc:
+                logging.error(
+                    "LM Studio health check failed (%s). Is LM Studio running with the local server enabled?",
+                    exc,
+                )
+                models = []
+
+        self._lmstudio_model_cache = (now, models)
+        return models
+
+    def _lmstudio_unload_model(self, model_id: str) -> bool:
+        """
+        Unloads a specific model from LM Studio using its CLI.
+        Returns True if successful, False otherwise.
+        """
+        logging.info(f"Attempting to unload model '{model_id}' using lms CLI.")
+        if not self.lms_path:
+            self.lms_path = self._find_lms_cli()
+        cli = self.lms_path
+        if not cli:
+            logging.error("lms CLI executable not found. Make sure 'lms' is in your system PATH or ~/.lmstudio/bin.")
+            return False
+        try:
+            command = [cli, "unload", model_id]
+            
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False, # Do not raise CalledProcessError automatically
             )
-            return []
+
+            if result.returncode == 0:
+                logging.info(f"lms CLI successfully unloaded model '{model_id}'. Output: {result.stdout.strip()}")
+                return True
+            else:
+                logging.error(f"lms CLI failed to unload model '{model_id}'. "
+                              f"Exit Code: {result.returncode}, Stderr: {result.stderr.strip()}")
+                return False
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while trying to unload model '{model_id}' with lms CLI: {e}")
+            return False
+
+    def _lmstudio_unload_all_models(self) -> None:
+        """
+        Unloads all models currently active in LM Studio.
+        This is typically called to free up VRAM for accurate detection.
+        """
+        logging.info("Attempting to unload all models from LM Studio for VRAM assessment.")
+        if not self.lms_path:
+            self.lms_path = self._find_lms_cli()
+        cli = self.lms_path
+        if not cli:
+            logging.warning("Skipping unload: lms CLI not found.")
+            return
+
+        try:
+            # Prefer the native `lms unload --all` command to ensure all loaded models are cleared.
+            result = subprocess.run(
+                [cli, "unload", "--all"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if result.returncode == 0:
+                logging.info(f"All models unloaded via 'lms unload --all'. Output: {result.stdout.strip()}")
+                return
+
+            logging.error(
+                "lms unload --all failed (exit %s). Falling back to per-model unload. Stderr: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+        except FileNotFoundError:
+            logging.warning("Skipping unload: lms CLI not found.")
+            return
+        except Exception as exc:
+            logging.error(f"lms unload --all raised an error: {exc}")
+
+        # Fallback: best-effort unload each available model via CLI.
+        try:
+            all_known_models = self._lmstudio_available_models()
+            for model_id in all_known_models:
+                if self._lmstudio_unload_model(model_id):
+                    logging.info(f"Successfully unloaded model '{model_id}'.")
+                else:
+                    logging.warning(f"Could not unload model '{model_id}'. It might not have been loaded or an error occurred.")
+        except Exception as e:
+            logging.error(f"Error during attempt to unload all LM Studio models: {e}")
+
+    def _lmstudio_prepare_model(self, model_id: str, prompt: str) -> bool:
+        """
+        Ensure the desired model is downloaded, fits hardware, and is loaded with
+        a sufficient context length.
+        """
+        cli = self.lms_path or self._find_lms_cli()
+        if not cli:
+            logging.error("Cannot prepare LM Studio model: lms CLI not found.")
+            return False
+
+        # Download if missing
+        installed = self._lmstudio_available_models()
+        if model_id not in installed:
+            logging.info("Model '%s' not found locally. Attempting download via 'lms get'.", model_id)
+            try:
+                get_cmd = [cli, "get", model_id, "--yes"]
+                result = subprocess.run(
+                    get_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    check=False,
+                )
+                if result.returncode != 0 and "--yes" in get_cmd:
+                    # Retry without --yes for older lms versions that lack the flag
+                    logging.warning("Retrying 'lms get' without --yes (exit %s).", result.returncode)
+                    result = subprocess.run(
+                        [cli, "get", model_id],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="ignore",
+                        check=False,
+                    )
+                if result.returncode != 0:
+                    logging.error("Failed to download model '%s' via lms get (exit %s): %s", model_id, result.returncode, result.stderr.strip())
+                    return False
+                # refresh cache
+                self._lmstudio_model_cache = (0.0, [])
+            except Exception as exc:
+                logging.error("Error running 'lms get %s': %s", model_id, exc)
+                return False
+
+        # Free VRAM before load
+        self._lmstudio_unload_all_models()
+
+        # Load with an effective context length
+        ctx_tokens = self._effective_context_limit(prompt)
+
+        # Estimate VRAM before loading to avoid overcommitting
+        if not self._lmstudio_estimate_ok(model_id, ctx_tokens):
+            return False
+
+        try:
+            load_cmd = [cli, "load", model_id, "--context-length", str(ctx_tokens), "--yes"]
+            result = subprocess.run(
+                load_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if result.returncode != 0 and "--yes" in load_cmd:
+                logging.warning("Retrying 'lms load' without --yes (exit %s).", result.returncode)
+                result = subprocess.run(
+                    [cli, "load", model_id, "--context-length", str(ctx_tokens)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    check=False,
+                )
+            if result.returncode != 0:
+                logging.error("Failed to load model '%s' (exit %s): %s", model_id, result.returncode, result.stderr.strip())
+                return False
+            logging.info("Loaded model '%s' with context length %s", model_id, ctx_tokens)
+            return True
+        except Exception as exc:
+            logging.error("Error while loading model '%s': %s", model_id, exc)
+            return False
+
+    def _lmstudio_estimate_ok(self, model_id: str, ctx_tokens: int) -> bool:
+        """
+        Use `lms load --estimate-only` to check GPU memory requirements before loading.
+        Falls back to heuristic VRAM check if estimate is unavailable.
+        """
+        cli = self.lms_path or self._find_lms_cli()
+        if not cli:
+            return False
+
+        try:
+            estimate_cmd = [cli, "load", model_id, "--context-length", str(ctx_tokens), "--estimate-only"]
+            result = subprocess.run(
+                estimate_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout:
+                parsed = self._parse_estimated_vram(result.stdout)
+                if parsed is not None:
+                    if parsed > self.max_vram_gb:
+                        logging.error(
+                            "Model '%s' estimated GPU memory %.2f GB exceeds detected max GPU VRAM (%s GB).",
+                            model_id,
+                            parsed,
+                            self.max_vram_gb,
+                        )
+                        return False
+                    return True
+        except Exception as exc:
+            logging.warning("VRAM estimate via lms failed: %s; falling back to heuristic.", exc)
+
+        # Fallback heuristic
+        required_vram = self._required_vram_for_model(model_id)
+        if required_vram is not None and required_vram > self.max_vram_gb:
+            logging.error(
+                "Model '%s' requires ~%s GB VRAM which exceeds detected max GPU VRAM (%s GB).",
+                model_id,
+                required_vram,
+                self.max_vram_gb,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _parse_estimated_vram(text: str) -> Optional[float]:
+        import re
+
+        match = re.search(r"Estimated GPU Memory:\s*([\d\.]+)\s*GB", text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+        return None
 
     def _required_vram_for_model(self, model: str) -> Optional[int]:
         """
@@ -387,18 +717,23 @@ class LLMProvider:
             return model_benchmarks[model]["vram_gb"]
 
         # Fallback to heuristic if no benchmark data
-        tokens = re.split(r"[^\w]+", model.lower())
-        for token in tokens:
-            if token.endswith("b") and token[:-1].isdigit():
-                size = int(token[:-1])
+        match = re.search(r"(\d+(?:\.\d+)?)\s*b", model.lower())
+        if match:
+            try:
+                size = float(match.group(1))
+                if size <= 2:
+                    return 1
+                if size <= 3:
+                    return 2
+                if size <= 4:
+                    return 3
                 if size <= 7:
                     return 4
-                if size == 8:
-                    return 5
-                if size == 9:
+                if size <= 9:
                     return 6
-                if size >= 13:
-                    return 10
+                return 10
+            except ValueError:
+                pass
         logging.warning(f"No VRAM benchmark data or heuristic match for model: {model}. Cannot determine VRAM requirements.")
         return None
 
@@ -408,7 +743,7 @@ class LLMProvider:
         return os.getenv(task_key) or os.getenv("LMSTUDIO_MODEL")
 
     def _select_model_for_lmstudio(
-        self, task_type: str, available_models: Optional[List[str]] = None
+        self, task_type: str, available_models: Optional[List[str]] = None, estimate_ctx_tokens: Optional[int] = None
     ) -> Optional[str]:
         """
         Selects an appropriate LM Studio model based on the task type, available models,
@@ -429,6 +764,7 @@ class LLMProvider:
         }
 
         available_models = available_models or []
+        available_set = set(available_models)
         model_benchmarks = self._get_model_info_from_benchmarks()
 
         # Task-specific or global override takes priority
@@ -463,18 +799,19 @@ class LLMProvider:
         
         # Iterate through unique candidate models first
         for model_name in unique_candidate_models:
-            if model_name not in available_models:
-                logging.debug(f"LM Studio model '{model_name}' not currently available in LM Studio.")
-                continue
-
             model_info = model_benchmarks.get(model_name)
             if not model_info:
-                logging.warning(f"No benchmark info found for model '{model_name}'. Skipping for intelligent selection.")
-                continue
-
-            vram_gb = model_info.get("vram_gb")
-            ram_gb = model_info.get("ram_gb")
-            performance_score = model_info.get("performance_score")
+                vram_gb = self._required_vram_for_model(model_name)
+                ram_gb = self.total_ram_gb  # assume fits RAM if we only have heuristic VRAM
+                performance_score = 0.0
+                logging.info(f"No benchmark data for '{model_name}', using heuristic VRAM: {vram_gb} GB.")
+                if vram_gb is None and estimate_ctx_tokens and model_name in available_set:
+                    if not self._lmstudio_estimate_ok(model_name, estimate_ctx_tokens):
+                        continue
+            else:
+                vram_gb = model_info.get("vram_gb")
+                ram_gb = model_info.get("ram_gb")
+                performance_score = model_info.get("performance_score")
 
             if vram_gb is None or ram_gb is None or performance_score is None:
                 logging.warning(f"Incomplete benchmark info for model '{model_name}'. Skipping for intelligent selection.")
@@ -533,13 +870,30 @@ class LLMProvider:
             selected_model = eligible_models[0][0]
             logging.info(f"Selected LM Studio model: '{selected_model}' (Performance: {eligible_models[0][1]}).")
             return selected_model
-        else:
+        elif available_models:
+            # Last-resort fallback: pick the first available model that appears to fit VRAM constraints.
+            for candidate in available_models:
+                vram_hint = self._required_vram_for_model(candidate)
+                if vram_hint is None and estimate_ctx_tokens:
+                    if not self._lmstudio_estimate_ok(candidate, estimate_ctx_tokens):
+                        continue
+                if vram_hint is None or vram_hint <= self.max_vram_gb:
+                    logging.warning(
+                        "No LM Studio benchmark metadata available; falling back to available model: '%s'.",
+                        candidate,
+                    )
+                    return candidate
             logging.error(
-                "No suitable LM Studio model found that fits hardware constraints after checking "
-                "predefined lists and all available models. "
-                "Please check LM Studio is running and has models loaded, or adjust hardware."
+                "Available LM Studio models exist but all appear to exceed VRAM constraints (%s GB).",
+                self.max_vram_gb,
             )
             return None
+        logging.error(
+            "No suitable LM Studio model found that fits hardware constraints after checking "
+            "predefined lists and all available models. "
+            "Please check LM Studio is running and has models loaded, or adjust hardware."
+        )
+        return None
 
     # ---- Rule-based fallbacks -------------------------------------------------
 
@@ -602,7 +956,10 @@ class LLMProvider:
         # by detecting GPU VRAM dynamically.
         detected_vram = self._detect_gpu_vram_gb()
         if detected_vram is not None:
-            self.max_vram_gb = min(self.max_vram_gb, detected_vram) # Use the lower of default/detected
+            calculated = max(self.max_vram_gb, detected_vram)
+            if self.vram_cap_gb:
+                calculated = min(calculated, self.vram_cap_gb)
+            self.max_vram_gb = calculated
 
         logging.info(f"Detected hardware: CPU Cores: {self.cpu_cores}, Total RAM: {self.total_ram_gb} GB, Max VRAM: {self.max_vram_gb} GB")
 
@@ -630,7 +987,7 @@ class LLMProvider:
         system = platform.system()
         try:
             if system == "Windows":
-                # Use wmic for Windows
+                # Use wmic for Windows to get total AdapterRAM
                 result = subprocess.run(
                     ["wmic", "path", "Win32_VideoController", "get", "AdapterRAM"],
                     capture_output=True,
@@ -639,14 +996,24 @@ class LLMProvider:
                     creationflags=subprocess.CREATE_NO_WINDOW # Hide console window
                 )
                 if result.returncode == 0 and "AdapterRAM" in result.stdout:
-                    # Parse output, typically like: "AdapterRAM\n1073741824\n"
-                    lines = result.stdout.strip().split('\n')
+                    # Parse all reported adapters; pick the largest non-zero VRAM value.
+                    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+                    vram_candidates_gb = []
                     for line in lines:
-                        if line.strip().isdigit():
-                            ram_bytes = int(line.strip())
-                            return int(ram_bytes / (1024**3))
+                        if line.isdigit():
+                            ram_bytes = int(line)
+                            if ram_bytes > 0:
+                                vram_candidates_gb.append(ram_bytes / (1024**3))
+                    if vram_candidates_gb:
+                        detected = int(max(vram_candidates_gb))
+                        logging.info(
+                            "Windows GPU VRAM candidates (GB): %s; using max=%s",
+                            [round(x, 2) for x in vram_candidates_gb],
+                            detected,
+                        )
+                        return detected
             elif system == "Linux" or system == "Darwin": # Linux and macOS
-                # Try nvidia-smi first
+                # Try nvidia-smi first for total VRAM
                 if shutil.which("nvidia-smi"):
                     result = subprocess.run(
                         ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
@@ -655,16 +1022,24 @@ class LLMProvider:
                         check=True
                     )
                     if result.returncode == 0:
-                        vram_mib = int(result.stdout.strip().split('\n')[0])
-                        return int(vram_mib / 1024)
+                        lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip().isdigit()]
+                        if lines:
+                            vram_candidates_gb = [int(val) / 1024 for val in lines]
+                            detected = int(max(vram_candidates_gb))
+                            logging.info(
+                                "nvidia-smi VRAM candidates (GB): %s; using max=%s",
+                                [round(x, 2) for x in vram_candidates_gb],
+                                detected,
+                            )
+                            return detected
                 # Fallback for other GPUs or if nvidia-smi not found (e.g., AMD, Intel)
                 # This is more complex and less reliable without specific tools.
                 # For now, we'll log a warning and return None.
                 logging.warning(
-                    f"Could not detect GPU VRAM for {system}. "
+                    f"Could not detect total GPU VRAM for {system}. "
                     "nvidia-smi not found or failed. "
                     "Manual detection for other GPUs (AMD/Intel) is not yet implemented. "
-                    "Defaulting to configured max_vram_gb."
+                    "Defaulting to configured max_vram_gb if detection fails."
                 )
             else:
                 logging.warning(f"Unsupported operating system for GPU VRAM detection: {system}")
