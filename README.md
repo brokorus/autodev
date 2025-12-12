@@ -36,3 +36,6 @@ From the repo root after install:
 - Env/flags: `AUTODEV_REPO`, `AUTODEV_BRANCH`, `AUTODEV_TARGET`, `AUTODEV_FORCE` (bash) or `-Repo`, `-Branch`, `-Force` (PowerShell)
 - Edit `.autodev/prompts/rules.md` or `AUTODEV_README.md` to tune behavior; these are injected into every prompt AutoDev sends.
 - Re-run the installer anytime to refresh to the latest AutoDev bits.
+- Narrative memory: AutoDev writes an append-only product story to `autodev/story/` (JSONL + Markdown digest). Entries have tags/status/files; do not delete these files.
+- Story IDs & code: each coder run gets a Story ID—add `STORY:<id>` inline comments near notable code changes so future iterations can find the corresponding narrative.
+- Ask the story: `./autodev.ps1 -Ask "How did the model management come to be?"` summarizes the product story related to your query with a concise retelling and suggested next steps.

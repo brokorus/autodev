@@ -9,6 +9,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 AUTODEV = Path(__file__).parent
 BASE = AUTODEV.parent
@@ -17,12 +18,15 @@ sys.path.append(str(AUTODEV))
 from llm_provider import LLMProvider
 from codex_cli import resolve_codex_command
 from state import AutoDevState
+from story import StoryLog
 
 
 LOGS = AUTODEV / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
 PM_DIR = AUTODEV / "pm"
 PM_DIR.mkdir(parents=True, exist_ok=True)
+STORY_DIR = AUTODEV / "story"
+STORY = StoryLog(STORY_DIR)
 DEFAULT_TIMEOUT = int(os.getenv("AUTODEV_CODER_TIMEOUT", "900"))
 DEFAULT_TEST_TIMEOUT = int(os.getenv("AUTODEV_TEST_TIMEOUT", "900"))
 CHECKPOINT_LOG = LOGS / "checkpoints.jsonl"
@@ -49,6 +53,15 @@ def sanitize(text: str) -> str:
     if not isinstance(text, str):
         return ""
     return text.replace("\x00", "")
+
+
+def story_safe_add(**kwargs) -> str | None:
+    """Never let story logging break the loop. Returns entry_id when possible."""
+    try:
+        return STORY.add_entry(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Story logging failed: %s", exc)
+        return None
 
 
 class GitCheckpointManager:
@@ -184,7 +197,17 @@ def load_autodev_readme() -> str:
     except OSError:
         return ""
 
-def snapshot(base: Path = BASE, max_chars: int = 60_000) -> str:
+
+def load_story_digest(limit: int = 12) -> str:
+    """
+    Provide a short, recent narrative to LLMs.
+    """
+    try:
+        return STORY.context_view(head=limit, big_picture=4, max_chars=3800)
+    except Exception:  # noqa: BLE001
+        return "No story digest available yet."
+
+def snapshot(base: Path = BASE, max_chars: int = 40_000) -> str:
     """
     Capture a text-only snapshot of the repo for the planner.
     Skips noisy/irrelevant directories (including .autodev) and truncates output.
@@ -442,20 +465,32 @@ def codex(prompt: str, sandbox: str = "workspace-write") -> str:
     return proc.stdout
 
 
-def implement(task: dict, board_snapshot: str, expertise: str) -> str:
-    llm_provider = LLMProvider()
-    autodev_readme = load_autodev_readme()
-    prompt = """
+def implement(task: dict, board_snapshot: str, expertise: str, story_ref: Optional[str]) -> str:
+    with LLMProvider() as llm_provider:
+        autodev_readme = load_autodev_readme()
+        story_digest = load_story_digest()
+        impl_spec = task.get("impl_spec") or {}
+        impl_spec_text = json.dumps(impl_spec, indent=2) if impl_spec else "None provided."
+        prompt = """
 {rules}
 
 AUTODEV_README (system overview):
 {autodev_readme}
+
+PRODUCT STORY (recent narrative):
+{story_digest}
+
+STORY REFERENCE FOR THIS ITERATION:
+{story_ref}
 
 You are the CODER.
 Operate as: {expertise}
 
 TASK:
 {task}
+
+Implementation spec from planner (follow exactly, extend only when necessary):
+{impl_spec}
 
 TESTS:
 {tests}
@@ -470,22 +505,27 @@ Requirements:
 - Add or update tests as needed.
 - Run: npm test && npx playwright test
 - Fix any test failures and rerun until everything passes.
+- When you add or change code, include a nearby inline comment with `STORY:{story_ref}` (use the provided Story ID) to link the narrative to the code. Keep these comments concise.
 - Assume GitHub Actions will run on push; the orchestrator will check deployment status separately.
+- Keep context tight: prefer the referenced files/functions; do not invent APIs or files that are not in the snapshot.
 - Be verbose in your final response:
   - Start with a clear plan/approach describing the concrete steps you will take.
   - List each action performed (commands run, files created/updated, rationale).
   - Call out the status of each listed test and any additional tests you ran.
-  - Finish with next steps or remaining risks, even if none.
+- Finish with next steps or remaining risks, even if none.
 """.format(
-        rules=RULES,
-        autodev_readme=autodev_readme or "No AUTODEV_README.md provided.",
-        task=task["task"],
-        tests=json.dumps(task["tests"], indent=2),
-        board_snapshot=board_snapshot or "No tickets logged yet.",
-        expertise=expertise,
-        base=BASE,
-    )
-    return llm_provider.code(prompt)
+            rules=RULES,
+            autodev_readme=autodev_readme or "No AUTODEV_README.md provided.",
+            task=task["task"],
+            impl_spec=impl_spec_text,
+            tests=json.dumps(task["tests"], indent=2),
+            board_snapshot=board_snapshot or "No tickets logged yet.",
+            expertise=expertise,
+            base=BASE,
+            story_digest=story_digest or "No story digest available.",
+            story_ref=story_ref or "STORY:missing",
+        )
+        return llm_provider.code(prompt)
 
 
 def verify_deployment() -> dict:
@@ -500,9 +540,9 @@ def verify_deployment() -> dict:
 
 
 def troubleshoot_deployment(deploy_result: dict, task: dict) -> str:
-    llm_provider = LLMProvider()
-    autodev_readme = load_autodev_readme()
-    prompt = """
+    with LLMProvider() as llm_provider:
+        autodev_readme = load_autodev_readme()
+        prompt = """
 {rules}
 
 AUTODEV_README (system overview):
@@ -523,12 +563,12 @@ Instructions:
 - Ensure tests still pass.
 - Aim for a successful deployment on the next GitHub Actions run.
 """.format(
-        rules=RULES,
-        autodev_readme=autodev_readme or "No AUTODEV_README.md provided.",
-        deploy=json.dumps(deploy_result, indent=2),
-        task=json.dumps(task, indent=2),
-    )
-    return llm_provider.troubleshoot(prompt)
+            rules=RULES,
+            autodev_readme=autodev_readme or "No AUTODEV_README.md provided.",
+            deploy=json.dumps(deploy_result, indent=2),
+            task=json.dumps(task, indent=2),
+        )
+        return llm_provider.troubleshoot(prompt)
 
 
 
@@ -553,12 +593,29 @@ def main() -> None:
             )
             print("Planner running in ask/read-only mode with enforced timeout.")
             backlog_data = create_backlog(snap)
+            story_safe_add(
+                kind="plan",
+                title=f"Planner iteration {iteration}",
+                summary="Planner generated backlog items from snapshot.",
+                iteration=iteration,
+                tags=["plan"],
+                details={"backlog_raw": backlog_data},
+            )
             halt_reason = (backlog_data.get("halt_reason") or "").strip()
             if halt_reason:
                 print(
                     "Planner halted work due to non-free/prereq constraint: {}".format(
                         halt_reason
                     )
+                )
+                story_safe_add(
+                    kind="plan",
+                    title=f"Planner halted iteration {iteration}",
+                    summary="Planner stopped due to halt_reason.",
+                    iteration=iteration,
+                    status="halted",
+                    tags=["plan", "halted"],
+                    details={"halt_reason": halt_reason},
                 )
                 break
 
@@ -660,11 +717,40 @@ def main() -> None:
                 print(f"Checkpoint captured before changes: {pre_checkpoint}")
 
             board_snapshot = summarize_board(state)
-            result = implement(task, board_snapshot, derive_expertise(task))
+            code_story_id = story_safe_add(
+                kind="code",
+                title=f"Coder start for {task_id}",
+                summary="Coder began implementation for task.",
+                iteration=iteration,
+                task_id=task_id,
+                task=task_label,
+                status="in_progress",
+                tests=task.get("tests", []),
+                tags=["code", task_id],
+            )
+            result = implement(task, board_snapshot, derive_expertise(task), code_story_id)
             print(result)
+            story_safe_add(
+                kind="code",
+                title=f"Coder work on {task_id}",
+                summary="Coder produced implementation output.",
+                iteration=iteration,
+                task_id=task_id,
+                task=task_label,
+                status="in_progress",
+                tests=task.get("tests", []),
+                tags=["code", task_id],
+                details={"output_log": str((LOGS / f"run_{iteration}.log").as_posix()), "story_ref": code_story_id},
+            )
 
             log_path = LOGS / "run_{}.log".format(iteration)
             log_path.write_text(result, encoding="utf-8", errors="ignore")
+
+            changed_paths = []
+            try:
+                changed_paths = git_cp._changed_paths()
+            except Exception:
+                changed_paths = []
 
             test_outcome = run_rigorous_tests(iteration, task_label)
             if test_outcome.get("ran"):
@@ -684,12 +770,38 @@ def main() -> None:
 
             if test_outcome.get("all_passed", True):
                 state.mark_done(task_id, iteration, test_outcome)
+                story_safe_add(
+                    kind="tests",
+                    title=f"Tests passed for {task_id}",
+                    summary="All configured test commands passed after coder changes.",
+                    iteration=iteration,
+                    task_id=task_id,
+                    task=task_label,
+                    status="done",
+                    tests=[r["command"] for r in test_outcome.get("results", [])],
+                    files=changed_paths,
+                    tags=["tests", "pass", task_id],
+                    details=test_outcome,
+                )
             else:
                 state.mark_failed(task_id, iteration, test_outcome)
                 fix_tasks = state.create_fix_tasks(task_id, task_label, test_outcome)
                 if fix_tasks:
                     state.add_tasks(fix_tasks)
                     print("Added {} remediation task(s) based on failing tests.".format(len(fix_tasks)))
+                story_safe_add(
+                    kind="tests",
+                    title=f"Tests failed for {task_id}",
+                    summary="At least one test command failed; remediation tasks may be added.",
+                    iteration=iteration,
+                    task_id=task_id,
+                    task=task_label,
+                    status="needs_fix",
+                    tests=[r["command"] for r in test_outcome.get("results", [])],
+                    files=changed_paths,
+                    tags=["tests", "fail", task_id],
+                    details=test_outcome,
+                )
 
             post_meta = {
                 "iteration": iteration,
@@ -716,6 +828,16 @@ def main() -> None:
                 print(fix_output)
                 fix_log_path = LOGS / "deploy_fix_{}.log".format(iteration)
                 fix_log_path.write_text(fix_output, encoding="utf-8", errors="ignore")
+                story_safe_add(
+                    kind="deployment",
+                    title=f"Deployment troubleshooting iteration {iteration}",
+                    summary="GitHub Actions deployment was not successful; troubleshooting run recorded.",
+                    iteration=iteration,
+                    task_id=task_id,
+                    task=task_label,
+                    status="deploy_fix",
+                    details=deploy,
+                )
 
             time.sleep(10)
         except Exception as exc:  # noqa: BLE001
@@ -729,6 +851,14 @@ def main() -> None:
                 "Iteration {} hit an error: {}. Logged to {}. Sleeping before retry...".format(
                     iteration, exc, err_path
                 )
+            )
+            story_safe_add(
+                kind="error",
+                title=f"Iteration {iteration} exception",
+                summary="Orchestrator loop hit an exception; see error log.",
+                iteration=iteration,
+                status="error",
+                details={"exception": repr(exc), "error_log": str(err_path)},
             )
             time.sleep(30)
             continue

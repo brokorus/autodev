@@ -3,7 +3,20 @@
 This file is injected into all LLM prompts (planner, coder, troubleshooter). Keep it up to date when behavior changes.
 
 ## Entry Points
-- `autodev.ps1` (repo root): Bootstrap. Ensures Codex/Gemini CLIs are on `PATH` (uses `.autodev/codex_path.txt` hint, optionally installs via `npm install -g codex|gemini` or env overrides), creates/uses `.autodev/venv`, installs `.autodev/requirements-autodev.txt`, then runs `.autodev/orchestrator.py`. Flags: `-SkipVenvCreate`, `-SkipCliInstall`, `-LocalOnly`/`-l` (forces LLMProvider to use local providers only and skip hosted Gemini).
+- `autodev.ps1` (repo root): Bootstrap. Ensures Codex/Gemini CLIs are on `PATH` (uses `.autodev/codex_path.txt` hint, optionally installs via `npm install -g codex|gemini` or env overrides), creates/uses `.autodev/venv`, installs `.autodev/requirements-autodev.txt`, then runs `.autodev/orchestrator.py`. Flags: `-SkipVenvCreate`, `-SkipCliInstall`, `-NoInstall` (skip installing missing CLIs), `-InstallOnly` (ensure deps then exit), `-LocalOnly`/`-l` (force local providers / LM Studio only).
+
+### Running it
+- Run from repo root: `./autodev.ps1 -LocalOnly -NoInstall` (Windows PowerShell). Do **not** `cd autodev` before running; the script expects repo root paths.
+- Ensure LM Studio has at least one small model pre-downloaded (e.g., `TinyLlama-1.1B`) to avoid first-run downloads when VRAM is tight.
+- To cap VRAM use when detection overestimates, set `LMSTUDIO_VRAM_CAP_GB=<int>`; otherwise AutoDev now prefers the largest detected adapter VRAM to avoid under-reporting iGPU RAM.
+
+## Product Story (do not prune)
+- Directory: `autodev/story/` (copied alongside this file). Contains append-only `story.log.jsonl`, per-entry Markdown, and `index.md` digest for quick LLM consumption.
+- Auto updates when planner runs, coder runs/tests, deployment troubleshooting happens, or the orchestrator throws exceptions. Entries carry tags/status/files when known.
+- Goal: persistent narrative memory so LLMs know what was tried, what worked, and what to avoid repeating. Add new entries; never delete existing ones.
+- Story IDs: each coder iteration gets a `STORY:<id>` marker—add a small inline code comment containing that marker near significant changes so later agents can find the rationale quickly.
+- Context management: prompts use a concise HEADLINES + BIG PICTURE view from `StoryLog.context_view()` to keep context budgets small while retaining intent.
+- Story Q&A: run `autodev.ps1 -Ask "How did the model management come to be?"` to get a concise narrative and improvement ideas for a specific feature/question.
 
 ## Core Python Modules
 - `.autodev/orchestrator.py`
